@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+workspace_config.json
+founderos.log
+*.egg-info/
+dist/
+build/
