@@ -1,41 +1,34 @@
 import logging
 
-from models.schemas import ProjectPlan, Task, Feature, WorkspaceConfig
-from agents.planner import planner_agent
-from agents.architect import architect_agent
-from agents.task_generator import task_generator_agent
-from agents.doc_writer import doc_writer_agent
-from agents.sprint_planner import sprint_planner_agent
-from services.workspace_builder import workspace_builder
+from models.schemas import ProjectPlan, Task, Document, WorkspaceConfig
+from agents.planner import PlannerAgent
+from agents.architect import ArchitectAgent
+from agents.task_generator import TaskGeneratorAgent
+from agents.doc_writer import DocWriterAgent
+from agents.sprint_planner import SprintPlannerAgent
+from services.workspace_builder import WorkspaceBuilder
 
 logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    """Main brain that coordinates all agents and builds the workspace."""
+    """Main brain that coordinates all agents and the MCP-powered workspace builder."""
 
-    def __init__(self):
-        self.planner = planner_agent
-        self.architect = architect_agent
-        self.task_generator = task_generator_agent
-        self.doc_writer = doc_writer_agent
-        self.sprint_planner = sprint_planner_agent
-        self.builder = workspace_builder
+    def __init__(self, mcp_client):
+        self.mcp = mcp_client
+        self.planner = PlannerAgent()
+        self.architect = ArchitectAgent()
+        self.task_generator = TaskGeneratorAgent()
+        self.doc_writer = DocWriterAgent()
+        self.sprint_planner = SprintPlannerAgent()
+        self.builder = WorkspaceBuilder(mcp_client)
 
-    def create_workspace(
+    async def create_workspace(
         self,
         startup_description: str,
         on_status: callable = None,
     ) -> WorkspaceConfig:
-        """Full pipeline: idea -> plan -> architecture -> tasks -> docs -> Notion workspace.
-
-        Args:
-            startup_description: User's natural language startup idea.
-            on_status: Optional callback for status updates, receives (emoji, message).
-
-        Returns:
-            WorkspaceConfig with all created Notion resource IDs.
-        """
+        """Full pipeline: idea -> plan -> architecture -> tasks -> docs -> Notion workspace via MCP."""
 
         def status(emoji: str, msg: str):
             if on_status:
@@ -49,7 +42,11 @@ class Orchestrator:
 
         # Step 2: Architecture
         status("🏗️", "Designing architecture...")
-        architecture_doc = self.architect.design(plan)
+        arch_doc = Document(
+            title="Technical Architecture",
+            doc_type="Architecture",
+            content=self.architect.design(plan),
+        )
         status("✅", "Architecture document generated")
 
         # Step 3: Generate tasks for all features
@@ -62,43 +59,39 @@ class Orchestrator:
 
         # Step 4: Write PRD docs for P0 and P1 features
         status("📄", "Writing documentation for priority features...")
-        feature_docs: dict[str, str] = {}
+        docs: list[Document] = [arch_doc]
         priority_features = [f for f in plan.features if f.priority in ("P0", "P1")]
         for feature in priority_features:
-            doc = self.doc_writer.write(plan, feature.name)
-            feature_docs[feature.name] = doc
-        status("✅", f"Generated {len(feature_docs)} PRD documents")
+            content = self.doc_writer.write(plan, feature.name)
+            docs.append(Document(
+                title=f"PRD: {feature.name}",
+                doc_type="PRD",
+                content=content,
+                feature=feature.name,
+            ))
+        status("✅", f"Generated {len(docs)} documents")
 
-        # Step 5: Build Notion workspace
-        status("🚀", "Building Notion workspace...")
-        config = self.builder.build_workspace(
+        # Step 5: Build Notion workspace via MCP
+        status("🚀", "Building Notion workspace via MCP...")
+        config = await self.builder.build(
             plan=plan,
             tasks=all_tasks,
-            architecture_doc=architecture_doc,
-            feature_docs=feature_docs,
+            docs=docs,
         )
         status(
             "✅",
             f"Workspace created! {len(plan.features)} features, "
-            f"{len(all_tasks)} tasks, {len(feature_docs)} documents",
+            f"{len(all_tasks)} tasks, {len(docs)} documents",
         )
 
         return config
 
-    def update_workspace(
+    async def update_workspace(
         self,
         update_request: str,
         on_status: callable = None,
     ) -> WorkspaceConfig | None:
-        """Update an existing workspace with new features/tasks.
-
-        Args:
-            update_request: Natural language description of what to add/change.
-            on_status: Optional callback for status updates.
-
-        Returns:
-            Updated WorkspaceConfig, or None if no workspace exists.
-        """
+        """Update an existing workspace with new features/tasks via MCP."""
 
         def status(emoji: str, msg: str):
             if on_status:
@@ -110,7 +103,6 @@ class Orchestrator:
             status("❌", "No existing workspace found. Use 'new' to create one first.")
             return None
 
-        # Use planner to generate new features from the update request
         status("🤖", "Analyzing update request...")
         context = (
             f"Existing project: {config.project_name}\n"
@@ -121,7 +113,6 @@ class Orchestrator:
         )
         plan = self.planner.plan(context)
 
-        # Filter out any features that already exist
         existing_names = set(config.feature_page_ids.keys())
         new_features = [f for f in plan.features if f.name not in existing_names]
 
@@ -129,26 +120,28 @@ class Orchestrator:
             status("ℹ️", "No new features to add.")
             return config
 
-        # Generate tasks for new features
         status("📋", f"Generating tasks for {len(new_features)} new features...")
         new_tasks: list[Task] = []
         for feature in new_features:
             tasks = self.task_generator.generate(feature)
             new_tasks.extend(tasks)
 
-        # Generate docs for P0/P1 new features
-        new_docs: dict[str, str] = {}
+        new_docs: list[Document] = []
         priority_new = [f for f in new_features if f.priority in ("P0", "P1")]
         if priority_new:
             status("📄", "Writing docs for new priority features...")
             for feature in priority_new:
-                plan.features = new_features  # context for doc writer
-                doc = self.doc_writer.write(plan, feature.name)
-                new_docs[feature.name] = doc
+                plan.features = new_features
+                content = self.doc_writer.write(plan, feature.name)
+                new_docs.append(Document(
+                    title=f"PRD: {feature.name}",
+                    doc_type="PRD",
+                    content=content,
+                    feature=feature.name,
+                ))
 
-        # Add to Notion
-        status("🚀", "Adding to Notion workspace...")
-        config = self.builder.add_features(config, new_features, new_tasks, new_docs)
+        status("🚀", "Adding to Notion workspace via MCP...")
+        config = await self.builder.add_features(config, new_features, new_tasks, new_docs)
         status(
             "✅",
             f"Added {len(new_features)} features, {len(new_tasks)} tasks, "
@@ -157,21 +150,11 @@ class Orchestrator:
 
         return config
 
-    def plan_sprints(
+    async def plan_sprints(
         self,
         on_status: callable = None,
     ) -> WorkspaceConfig | None:
-        """Analyze all tasks and create sprint plans in Notion.
-
-        Reads current tasks from the workspace, uses AI to organize them
-        into 2-week sprints, creates Sprint pages, and links tasks.
-
-        Args:
-            on_status: Optional callback for status updates.
-
-        Returns:
-            Updated WorkspaceConfig, or None if no workspace exists.
-        """
+        """Analyze all tasks and create sprint plans in Notion via MCP."""
 
         def status(emoji: str, msg: str):
             if on_status:
@@ -187,9 +170,9 @@ class Orchestrator:
             status("❌", "Sprints database not found. Recreate workspace with 'new'.")
             return None
 
-        # Read all tasks from Notion
-        status("📖", "Reading tasks from workspace...")
-        tasks = self.builder.get_all_tasks(config)
+        # Read all tasks from Notion via MCP
+        status("📖", "Reading tasks from workspace via MCP...")
+        tasks = await self.builder.get_all_tasks(config)
         if not tasks:
             status("ℹ️", "No tasks found in workspace.")
             return config
@@ -207,35 +190,33 @@ class Orchestrator:
         status(
             "✅",
             f"Sprint plan ready: {len(sprint_plan.sprints)} sprints, "
-            f"{sum(len(s.task_titles) for s in sprint_plan.sprints)} tasks assigned"
+            f"{sum(len(s.task_titles) for s in sprint_plan.sprints)} tasks assigned",
         )
 
-        # Build sprints in Notion
-        status("🏃", "Creating sprints in Notion...")
-        config = self.builder.build_sprints(config, sprint_plan)
+        # Build sprints in Notion via MCP
+        status("🏃", "Creating sprints in Notion via MCP...")
+        config = await self.builder.build_sprints(config, sprint_plan)
 
         # Set Sprint 1 to Active
         if sprint_plan.sprints:
             first_sprint = sprint_plan.sprints[0]
             first_sprint_pid = config.sprint_page_ids.get(first_sprint.name)
             if first_sprint_pid:
-                from services.notion_service import notion_service
-                notion_service.update_page(
-                    first_sprint_pid,
-                    {"Status": notion_service.select_property("Active")},
+                await self.mcp.update_page(
+                    page_id=first_sprint_pid,
+                    properties={"Status": {"select": {"name": "Active"}}},
                 )
 
         status(
             "✅",
-            f"Sprints created! {len(sprint_plan.sprints)} sprints in your Notion workspace"
+            f"Sprints created! {len(sprint_plan.sprints)} sprints in your Notion workspace",
         )
 
-        # Print sprint summary
         for sprint in sprint_plan.sprints:
             status(
                 "📅",
                 f"{sprint.name}: {sprint.start_date} → {sprint.end_date} "
-                f"({len(sprint.task_titles)} tasks)"
+                f"({len(sprint.task_titles)} tasks)",
             )
 
         return config
@@ -261,6 +242,3 @@ class Orchestrator:
                 "dashboard": config.dashboard_page_id,
             },
         }
-
-
-orchestrator = Orchestrator()

@@ -16,17 +16,7 @@ class DocWriterAgent:
         self.system_prompt = PROMPT_PATH.read_text()
 
     def write(self, plan: ProjectPlan, feature_name: str) -> str:
-        """Generate a PRD document for a specific feature.
-
-        Args:
-            plan: The full project plan for context.
-            feature_name: Name of the feature to document.
-
-        Returns:
-            Markdown PRD content.
-        """
         logger.info(f"Doc writer generating PRD for: {feature_name}")
-
         feature = next((f for f in plan.features if f.name == feature_name), None)
         if not feature:
             raise ValueError(f"Feature '{feature_name}' not found in plan.")
@@ -51,9 +41,5 @@ class DocWriterAgent:
             user_message=user_message,
             json_mode=False,
         )
-
         logger.info(f"PRD generated for {feature_name}")
         return response
-
-
-doc_writer_agent = DocWriterAgent()

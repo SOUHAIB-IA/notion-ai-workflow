@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import sys
 
@@ -6,8 +7,6 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
-
-from agents.orchestrator import orchestrator
 
 # Configure logging
 logging.basicConfig(
@@ -22,7 +21,8 @@ console = Console()
 def print_banner():
     banner = Text()
     banner.append("🚀 FounderOS", style="bold cyan")
-    banner.append(" — AI Startup Operating System\n\n", style="dim")
+    banner.append(" — AI Startup Operating System\n", style="dim")
+    banner.append("   Powered by Notion MCP\n\n", style="dim italic")
     banner.append("Commands:\n", style="bold")
     banner.append("  new     ", style="bold green")
     banner.append("— Create a new project workspace\n")
@@ -40,24 +40,22 @@ def print_banner():
 
 
 def status_callback(emoji: str, message: str):
-    """Display status updates with Rich formatting."""
     console.print(f"  {emoji} {message}")
 
 
-def cmd_new():
+async def cmd_new(orchestrator):
     idea = Prompt.ask("\n[bold cyan]Describe your startup idea[/bold cyan]")
     if not idea.strip():
         console.print("[red]Please provide a description.[/red]")
         return
 
     console.print()
-    with console.status("[bold green]Working...[/bold green]", spinner="dots"):
-        try:
-            config = orchestrator.create_workspace(idea, on_status=status_callback)
-        except Exception as e:
-            console.print(f"\n[bold red]Error:[/bold red] {e}")
-            logger.exception("Failed to create workspace")
-            return
+    try:
+        config = await orchestrator.create_workspace(idea, on_status=status_callback)
+    except Exception as e:
+        console.print(f"\n[bold red]Error:[/bold red] {e}")
+        logger.exception("Failed to create workspace")
+        return
 
     console.print(
         Panel(
@@ -71,20 +69,19 @@ def cmd_new():
     )
 
 
-def cmd_update():
+async def cmd_update(orchestrator):
     update_req = Prompt.ask("\n[bold yellow]What would you like to update?[/bold yellow]")
     if not update_req.strip():
         console.print("[red]Please describe the update.[/red]")
         return
 
     console.print()
-    with console.status("[bold green]Working...[/bold green]", spinner="dots"):
-        try:
-            config = orchestrator.update_workspace(update_req, on_status=status_callback)
-        except Exception as e:
-            console.print(f"\n[bold red]Error:[/bold red] {e}")
-            logger.exception("Failed to update workspace")
-            return
+    try:
+        config = await orchestrator.update_workspace(update_req, on_status=status_callback)
+    except Exception as e:
+        console.print(f"\n[bold red]Error:[/bold red] {e}")
+        logger.exception("Failed to update workspace")
+        return
 
     if config:
         console.print(
@@ -98,7 +95,7 @@ def cmd_update():
         )
 
 
-def cmd_status():
+async def cmd_status(orchestrator):
     status = orchestrator.get_status()
     if not status:
         console.print("[yellow]No workspace found. Use 'new' to create one.[/yellow]")
@@ -121,8 +118,7 @@ def cmd_status():
     console.print(table)
 
 
-def cmd_plan():
-    """Re-plan: essentially alias for update with planning focus."""
+async def cmd_plan(orchestrator):
     plan_req = Prompt.ask(
         "\n[bold magenta]What changes to the plan?[/bold magenta] "
         "(e.g., 'reprioritize auth to P0' or 'add mobile app support')"
@@ -132,37 +128,34 @@ def cmd_plan():
         return
 
     console.print()
-    with console.status("[bold green]Re-planning...[/bold green]", spinner="dots"):
-        try:
-            config = orchestrator.update_workspace(plan_req, on_status=status_callback)
-        except Exception as e:
-            console.print(f"\n[bold red]Error:[/bold red] {e}")
-            logger.exception("Failed to update plan")
-            return
+    try:
+        config = await orchestrator.update_workspace(plan_req, on_status=status_callback)
+    except Exception as e:
+        console.print(f"\n[bold red]Error:[/bold red] {e}")
+        logger.exception("Failed to update plan")
+        return
 
     if config:
         console.print("[bold green]Plan updated successfully.[/bold green]")
 
 
-def cmd_sprint():
+async def cmd_sprint(orchestrator):
     console.print(
         "\n[bold white]🏃 Sprint Planning[/bold white] — "
         "AI will analyze all tasks and organize them into 2-week sprints."
     )
     console.print()
-    with console.status("[bold green]Planning sprints...[/bold green]", spinner="dots"):
-        try:
-            config = orchestrator.plan_sprints(on_status=status_callback)
-        except Exception as e:
-            console.print(f"\n[bold red]Error:[/bold red] {e}")
-            logger.exception("Failed to plan sprints")
-            return
+    try:
+        config = await orchestrator.plan_sprints(on_status=status_callback)
+    except Exception as e:
+        console.print(f"\n[bold red]Error:[/bold red] {e}")
+        logger.exception("Failed to plan sprints")
+        return
 
     if config and config.sprint_page_ids:
         table = Table(title="🏃 Sprint Plan", border_style="white")
         table.add_column("Sprint", style="bold")
         table.add_column("Tasks", justify="right")
-        # We can only show names here since we don't store counts separately
         for name in config.sprint_page_ids:
             table.add_row(name, "—")
         console.print(table)
@@ -186,29 +179,50 @@ COMMANDS = {
 }
 
 
-def main():
+async def main():
     print_banner()
 
-    while True:
-        try:
-            command = Prompt.ask("\n[bold]>>>[/bold]").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Goodbye![/dim]")
-            sys.exit(0)
+    # Initialize MCP connection
+    from mcp_client.notion_mcp import notion_mcp
+    console.print("[dim]Connecting to Notion MCP server...[/dim]")
+    try:
+        await notion_mcp.connect()
+    except Exception as e:
+        console.print(f"[bold red]Failed to connect to Notion MCP:[/bold red] {e}")
+        console.print("[dim]Make sure Node.js/npx is installed and NOTION_API_KEY is set.[/dim]")
+        sys.exit(1)
 
-        if command in ("quit", "exit", "q"):
-            console.print("[dim]Goodbye![/dim]")
-            break
+    console.print(f"[green]Connected to Notion MCP ({len(notion_mcp.available_tools)} tools available)[/green]\n")
 
-        handler = COMMANDS.get(command)
-        if handler:
-            handler()
-        else:
-            console.print(
-                f"[red]Unknown command:[/red] {command}. "
-                f"Try: {', '.join(COMMANDS.keys())}, quit"
-            )
+    # Log discovered tool names for debugging
+    logger.info(f"MCP tools: {notion_mcp.list_tool_names()}")
+
+    from agents.orchestrator import Orchestrator
+    orchestrator = Orchestrator(notion_mcp)
+
+    try:
+        while True:
+            try:
+                command = Prompt.ask("\n[bold]>>>[/bold]").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]Goodbye![/dim]")
+                break
+
+            if command in ("quit", "exit", "q"):
+                console.print("[dim]Goodbye![/dim]")
+                break
+
+            handler = COMMANDS.get(command)
+            if handler:
+                await handler(orchestrator)
+            else:
+                console.print(
+                    f"[red]Unknown command:[/red] {command}. "
+                    f"Try: {', '.join(COMMANDS.keys())}, quit"
+                )
+    finally:
+        await notion_mcp.disconnect()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

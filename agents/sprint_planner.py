@@ -3,7 +3,7 @@ import logging
 from datetime import date
 from pathlib import Path
 
-from models.schemas import Task, Sprint, SprintPlan
+from models.schemas import Task, SprintPlan
 from services.groq_client import groq_client
 
 logger = logging.getLogger(__name__)
@@ -18,21 +18,11 @@ class SprintPlannerAgent:
         self.system_prompt = PROMPT_PATH.read_text()
 
     def plan_sprints(self, tasks: list[Task], start_date: str | None = None) -> SprintPlan:
-        """Generate a sprint plan from a list of tasks.
-
-        Args:
-            tasks: All tasks to organize into sprints.
-            start_date: ISO date string for Sprint 1 start. Defaults to today.
-
-        Returns:
-            A validated SprintPlan with sprints and task assignments.
-        """
         if not start_date:
             start_date = date.today().isoformat()
 
         logger.info(f"Sprint planner organizing {len(tasks)} tasks starting {start_date}...")
 
-        # Build task summary for the LLM
         task_lines = []
         for t in tasks:
             task_lines.append(
@@ -66,6 +56,3 @@ class SprintPlannerAgent:
             f"covering {sum(len(s.task_titles) for s in sprint_plan.sprints)} tasks"
         )
         return sprint_plan
-
-
-sprint_planner_agent = SprintPlannerAgent()

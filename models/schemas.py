@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 from pydantic import BaseModel
 
 
@@ -16,6 +16,13 @@ class Task(BaseModel):
     priority: Literal["P0", "P1", "P2", "P3"]
     effort: Literal["Small", "Medium", "Large"]
     status: str = "Not Started"
+
+
+class Document(BaseModel):
+    title: str
+    doc_type: str  # "PRD", "Architecture", "Guide"
+    content: str  # markdown
+    feature: Optional[str] = None
 
 
 class Sprint(BaseModel):

@@ -1,12 +1,26 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from agents.orchestrator import orchestrator
+from mcp_client.notion_mcp import notion_mcp
+from agents.orchestrator import Orchestrator
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Connect to Notion MCP on startup, disconnect on shutdown."""
+    await notion_mcp.connect()
+    app.state.orchestrator = Orchestrator(notion_mcp)
+    yield
+    await notion_mcp.disconnect()
+
 
 app = FastAPI(
     title="FounderOS API",
-    description="AI-powered startup operating system",
-    version="1.0.0",
+    description="AI-powered startup operating system — Powered by Notion MCP",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -42,25 +56,25 @@ class WorkspaceResponse(BaseModel):
 
 
 @app.post("/workspace", response_model=WorkspaceResponse)
-def create_workspace(req: CreateWorkspaceRequest):
-    """Create a new project workspace from a startup description."""
+async def create_workspace(req: CreateWorkspaceRequest):
+    """Create a new project workspace from a startup description via MCP."""
     try:
-        config = orchestrator.create_workspace(req.description)
+        config = await app.state.orchestrator.create_workspace(req.description)
         return WorkspaceResponse(
             project_name=config.project_name,
             root_page_id=config.root_page_id,
             features_count=len(config.feature_page_ids),
-            message="Workspace created successfully",
+            message="Workspace created successfully via Notion MCP",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/workspace", response_model=WorkspaceResponse)
-def update_workspace(req: UpdateWorkspaceRequest):
-    """Update an existing workspace with new features."""
+async def update_workspace(req: UpdateWorkspaceRequest):
+    """Update an existing workspace with new features via MCP."""
     try:
-        config = orchestrator.update_workspace(req.update_description)
+        config = await app.state.orchestrator.update_workspace(req.update_description)
         if not config:
             raise HTTPException(
                 status_code=404,
@@ -70,7 +84,7 @@ def update_workspace(req: UpdateWorkspaceRequest):
             project_name=config.project_name,
             root_page_id=config.root_page_id,
             features_count=len(config.feature_page_ids),
-            message="Workspace updated successfully",
+            message="Workspace updated successfully via Notion MCP",
         )
     except HTTPException:
         raise
@@ -79,9 +93,9 @@ def update_workspace(req: UpdateWorkspaceRequest):
 
 
 @app.get("/workspace/status", response_model=StatusResponse)
-def workspace_status():
+async def workspace_status():
     """Get current workspace summary."""
-    status = orchestrator.get_status()
+    status = app.state.orchestrator.get_status()
     if not status:
         raise HTTPException(
             status_code=404,
@@ -91,10 +105,10 @@ def workspace_status():
 
 
 @app.post("/workspace/sprints", response_model=SprintResponse)
-def plan_sprints():
-    """Analyze tasks and create sprint plans in Notion."""
+async def plan_sprints():
+    """Analyze tasks and create sprint plans in Notion via MCP."""
     try:
-        config = orchestrator.plan_sprints()
+        config = await app.state.orchestrator.plan_sprints()
         if not config:
             raise HTTPException(
                 status_code=404,
@@ -104,7 +118,7 @@ def plan_sprints():
             project_name=config.project_name,
             sprints_count=len(config.sprint_page_ids),
             sprint_names=list(config.sprint_page_ids.keys()),
-            message="Sprints created successfully",
+            message="Sprints created successfully via Notion MCP",
         )
     except HTTPException:
         raise
@@ -113,5 +127,9 @@ def plan_sprints():
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+async def health():
+    return {
+        "status": "ok",
+        "mcp_connected": notion_mcp.session is not None,
+        "mcp_tools_count": len(notion_mcp.available_tools),
+    }

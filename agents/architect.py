@@ -16,16 +16,7 @@ class ArchitectAgent:
         self.system_prompt = PROMPT_PATH.read_text()
 
     def design(self, plan: ProjectPlan) -> str:
-        """Generate an architecture document from a project plan.
-
-        Args:
-            plan: The project plan with features and tech stack.
-
-        Returns:
-            Markdown architecture document.
-        """
         logger.info("Architect agent designing architecture...")
-
         user_message = (
             f"Project: {plan.project_name}\n"
             f"Description: {plan.description}\n"
@@ -34,7 +25,6 @@ class ArchitectAgent:
         )
         for f in plan.features:
             user_message += f"- [{f.priority}] {f.name} ({f.category}): {f.description}\n"
-
         user_message += f"\nArchitecture Notes: {plan.architecture_notes}"
 
         response = groq_client.chat(
@@ -42,9 +32,5 @@ class ArchitectAgent:
             user_message=user_message,
             json_mode=False,
         )
-
         logger.info("Architecture document generated.")
         return response
-
-
-architect_agent = ArchitectAgent()
