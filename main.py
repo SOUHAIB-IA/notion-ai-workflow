@@ -30,6 +30,8 @@ def print_banner():
     banner.append("— Update existing workspace\n")
     banner.append("  status  ", style="bold blue")
     banner.append("— Show current workspace summary\n")
+    banner.append("  sprint  ", style="bold white")
+    banner.append("— Plan 2-week sprints from tasks\n")
     banner.append("  plan    ", style="bold magenta")
     banner.append("— Re-plan or adjust priorities\n")
     banner.append("  quit    ", style="bold red")
@@ -107,9 +109,13 @@ def cmd_status():
     table.add_column("Value")
     table.add_row("Features", str(status["features_count"]))
     table.add_row("Feature List", ", ".join(status["feature_names"]))
+    table.add_row("Sprints", str(status["sprints_count"]))
+    if status["sprint_names"]:
+        table.add_row("Sprint List", ", ".join(status["sprint_names"]))
     table.add_row("Root Page", status["workspace_ids"]["root_page"])
     table.add_row("Features DB", status["workspace_ids"]["features_db"])
     table.add_row("Tasks DB", status["workspace_ids"]["tasks_db"])
+    table.add_row("Sprints DB", status["workspace_ids"]["sprints_db"])
     table.add_row("Docs DB", status["workspace_ids"]["docs_db"])
     table.add_row("Dashboard", status["workspace_ids"]["dashboard"])
     console.print(table)
@@ -138,10 +144,44 @@ def cmd_plan():
         console.print("[bold green]Plan updated successfully.[/bold green]")
 
 
+def cmd_sprint():
+    console.print(
+        "\n[bold white]🏃 Sprint Planning[/bold white] — "
+        "AI will analyze all tasks and organize them into 2-week sprints."
+    )
+    console.print()
+    with console.status("[bold green]Planning sprints...[/bold green]", spinner="dots"):
+        try:
+            config = orchestrator.plan_sprints(on_status=status_callback)
+        except Exception as e:
+            console.print(f"\n[bold red]Error:[/bold red] {e}")
+            logger.exception("Failed to plan sprints")
+            return
+
+    if config and config.sprint_page_ids:
+        table = Table(title="🏃 Sprint Plan", border_style="white")
+        table.add_column("Sprint", style="bold")
+        table.add_column("Tasks", justify="right")
+        # We can only show names here since we don't store counts separately
+        for name in config.sprint_page_ids:
+            table.add_row(name, "—")
+        console.print(table)
+        console.print(
+            Panel(
+                f"[bold green]Sprints created![/bold green]\n"
+                f"Total sprints: {len(config.sprint_page_ids)}\n"
+                f"Sprint 1 set to [bold]Active[/bold]",
+                title="Success",
+                border_style="green",
+            )
+        )
+
+
 COMMANDS = {
     "new": cmd_new,
     "update": cmd_update,
     "status": cmd_status,
+    "sprint": cmd_sprint,
     "plan": cmd_plan,
 }
 

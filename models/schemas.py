@@ -18,6 +18,19 @@ class Task(BaseModel):
     status: str = "Not Started"
 
 
+class Sprint(BaseModel):
+    name: str
+    goals: str
+    start_date: str  # ISO format: "2026-03-12"
+    end_date: str  # ISO format: "2026-03-26"
+    task_titles: list[str]  # titles of tasks assigned to this sprint
+    status: str = "Planning"
+
+
+class SprintPlan(BaseModel):
+    sprints: list[Sprint]
+
+
 class ProjectPlan(BaseModel):
     project_name: str
     description: str
@@ -34,5 +47,10 @@ class WorkspaceConfig(BaseModel):
     docs_db_id: str
     decisions_db_id: str
     dashboard_page_id: str
+    sprints_db_id: str = ""
     # Maps feature name -> Notion page ID for relation linking
     feature_page_ids: dict[str, str] = {}
+    # Maps task title -> Notion page ID for sprint linking
+    task_page_ids: dict[str, str] = {}
+    # Maps sprint name -> Notion page ID
+    sprint_page_ids: dict[str, str] = {}

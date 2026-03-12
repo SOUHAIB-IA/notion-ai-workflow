@@ -5,6 +5,7 @@ from agents.planner import planner_agent
 from agents.architect import architect_agent
 from agents.task_generator import task_generator_agent
 from agents.doc_writer import doc_writer_agent
+from agents.sprint_planner import sprint_planner_agent
 from services.workspace_builder import workspace_builder
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ class Orchestrator:
         self.architect = architect_agent
         self.task_generator = task_generator_agent
         self.doc_writer = doc_writer_agent
+        self.sprint_planner = sprint_planner_agent
         self.builder = workspace_builder
 
     def create_workspace(
@@ -155,6 +157,89 @@ class Orchestrator:
 
         return config
 
+    def plan_sprints(
+        self,
+        on_status: callable = None,
+    ) -> WorkspaceConfig | None:
+        """Analyze all tasks and create sprint plans in Notion.
+
+        Reads current tasks from the workspace, uses AI to organize them
+        into 2-week sprints, creates Sprint pages, and links tasks.
+
+        Args:
+            on_status: Optional callback for status updates.
+
+        Returns:
+            Updated WorkspaceConfig, or None if no workspace exists.
+        """
+
+        def status(emoji: str, msg: str):
+            if on_status:
+                on_status(emoji, msg)
+            logger.info(msg)
+
+        config = self.builder.load_config()
+        if not config:
+            status("❌", "No existing workspace found. Use 'new' to create one first.")
+            return None
+
+        if not config.sprints_db_id:
+            status("❌", "Sprints database not found. Recreate workspace with 'new'.")
+            return None
+
+        # Read all tasks from Notion
+        status("📖", "Reading tasks from workspace...")
+        tasks = self.builder.get_all_tasks(config)
+        if not tasks:
+            status("ℹ️", "No tasks found in workspace.")
+            return config
+
+        plannable = [t for t in tasks if t.status in ("Not Started", "In Progress")]
+        status("📊", f"Found {len(plannable)} plannable tasks (of {len(tasks)} total)")
+
+        if not plannable:
+            status("ℹ️", "All tasks are already completed or in review.")
+            return config
+
+        # AI sprint planning
+        status("🤖", "AI is analyzing tasks and planning sprints...")
+        sprint_plan = self.sprint_planner.plan_sprints(plannable)
+        status(
+            "✅",
+            f"Sprint plan ready: {len(sprint_plan.sprints)} sprints, "
+            f"{sum(len(s.task_titles) for s in sprint_plan.sprints)} tasks assigned"
+        )
+
+        # Build sprints in Notion
+        status("🏃", "Creating sprints in Notion...")
+        config = self.builder.build_sprints(config, sprint_plan)
+
+        # Set Sprint 1 to Active
+        if sprint_plan.sprints:
+            first_sprint = sprint_plan.sprints[0]
+            first_sprint_pid = config.sprint_page_ids.get(first_sprint.name)
+            if first_sprint_pid:
+                from services.notion_service import notion_service
+                notion_service.update_page(
+                    first_sprint_pid,
+                    {"Status": notion_service.select_property("Active")},
+                )
+
+        status(
+            "✅",
+            f"Sprints created! {len(sprint_plan.sprints)} sprints in your Notion workspace"
+        )
+
+        # Print sprint summary
+        for sprint in sprint_plan.sprints:
+            status(
+                "📅",
+                f"{sprint.name}: {sprint.start_date} → {sprint.end_date} "
+                f"({len(sprint.task_titles)} tasks)"
+            )
+
+        return config
+
     def get_status(self) -> dict | None:
         """Get a summary of the current workspace."""
         config = self.builder.load_config()
@@ -164,12 +249,15 @@ class Orchestrator:
             "project_name": config.project_name,
             "features_count": len(config.feature_page_ids),
             "feature_names": list(config.feature_page_ids.keys()),
+            "sprints_count": len(config.sprint_page_ids),
+            "sprint_names": list(config.sprint_page_ids.keys()),
             "workspace_ids": {
                 "root_page": config.root_page_id,
                 "features_db": config.features_db_id,
                 "tasks_db": config.tasks_db_id,
                 "docs_db": config.docs_db_id,
                 "decisions_db": config.decisions_db_id,
+                "sprints_db": config.sprints_db_id,
                 "dashboard": config.dashboard_page_id,
             },
         }

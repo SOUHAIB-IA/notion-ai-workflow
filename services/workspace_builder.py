@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 
 from config import settings
-from models.schemas import Feature, Task, ProjectPlan, WorkspaceConfig
+from models.schemas import Feature, Task, Sprint, SprintPlan, ProjectPlan, WorkspaceConfig
 from services.notion_service import notion_service as notion
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,9 @@ class WorkspaceBuilder:
         logger.info("Creating Decisions database...")
         decisions_db_id = self._create_decisions_db(project_page_id)
 
+        logger.info("Creating Sprints database...")
+        sprints_db_id = self._create_sprints_db(project_page_id)
+
         # Step 3: Populate Features
         logger.info("Populating features...")
         feature_page_ids = {}
@@ -80,11 +83,13 @@ class WorkspaceBuilder:
             page_id = self._create_feature_page(features_db_id, feature)
             feature_page_ids[feature.name] = page_id
 
-        # Step 4: Populate Tasks
+        # Step 4: Populate Tasks (track page IDs for sprint linking)
         logger.info("Populating tasks...")
+        task_page_ids = {}
         for task in tasks:
             feature_pid = feature_page_ids.get(task.feature)
-            self._create_task_page(tasks_db_id, task, feature_pid)
+            task_pid = self._create_task_page(tasks_db_id, task, feature_pid)
+            task_page_ids[task.title] = task_pid
 
         # Step 5: Create architecture doc
         logger.info("Creating architecture document...")
@@ -101,7 +106,7 @@ class WorkspaceBuilder:
         # Step 7: Create Dashboard page
         logger.info("Creating dashboard page...")
         dashboard_page_id = self._create_dashboard(
-            project_page_id, plan, features_db_id, tasks_db_id
+            project_page_id, plan, features_db_id, tasks_db_id, sprints_db_id
         )
 
         config = WorkspaceConfig(
@@ -111,8 +116,10 @@ class WorkspaceBuilder:
             tasks_db_id=tasks_db_id,
             docs_db_id=docs_db_id,
             decisions_db_id=decisions_db_id,
+            sprints_db_id=sprints_db_id,
             dashboard_page_id=dashboard_page_id,
             feature_page_ids=feature_page_ids,
+            task_page_ids=task_page_ids,
         )
         self.save_config(config)
         return config
@@ -181,6 +188,21 @@ class WorkspaceBuilder:
             },
         )
 
+    def _create_sprints_db(self, parent_page_id: str) -> str:
+        return self.notion.create_database(
+            parent_page_id=parent_page_id,
+            title="🏃 Sprints",
+            properties_schema={
+                "Sprint Name": {"type": "title"},
+                "Goals": {"type": "rich_text"},
+                "Start Date": {"type": "date"},
+                "End Date": {"type": "date"},
+                "Status": {"type": "select", "options": [
+                    "Planning", "Active", "Completed", "Cancelled"
+                ]},
+            },
+        )
+
     # ── Page Creation ──────────────────────────────────────────────────
 
     def _create_feature_page(self, db_id: str, feature: Feature) -> str:
@@ -231,6 +253,7 @@ class WorkspaceBuilder:
         plan: ProjectPlan,
         features_db_id: str,
         tasks_db_id: str,
+        sprints_db_id: str = "",
     ) -> str:
         blocks = [
             self.notion.heading_block("Project Dashboard", level=1),
@@ -251,6 +274,8 @@ class WorkspaceBuilder:
         )
 
         # Add linked database views
+        if sprints_db_id:
+            self.notion.create_linked_database_view(dashboard_page_id, sprints_db_id, "Sprint Board")
         self.notion.create_linked_database_view(dashboard_page_id, features_db_id, "Features Overview")
         self.notion.create_linked_database_view(dashboard_page_id, tasks_db_id, "Priority Tasks")
 
@@ -283,6 +308,152 @@ class WorkspaceBuilder:
 
         self.save_config(config)
         return config
+
+    # ── Sprint Support ──────────────────────────────────────────────────
+
+    def build_sprints(
+        self,
+        config: WorkspaceConfig,
+        sprint_plan: SprintPlan,
+    ) -> WorkspaceConfig:
+        """Create sprint pages and link tasks to them via relation.
+
+        Args:
+            config: Current workspace config with task_page_ids.
+            sprint_plan: AI-generated sprint plan.
+
+        Returns:
+            Updated WorkspaceConfig with sprint_page_ids.
+        """
+        if not config.sprints_db_id:
+            raise ValueError("Sprints database not found. Recreate workspace with 'new' command.")
+
+        # Add Sprint relation column to Tasks DB if not already present
+        self._add_sprint_relation_to_tasks(config.tasks_db_id, config.sprints_db_id)
+
+        for sprint in sprint_plan.sprints:
+            # Create the sprint page
+            sprint_pid = self._create_sprint_page(config.sprints_db_id, sprint)
+            config.sprint_page_ids[sprint.name] = sprint_pid
+
+            # Link tasks to this sprint via relation
+            for task_title in sprint.task_titles:
+                task_pid = config.task_page_ids.get(task_title)
+                if task_pid:
+                    self.notion.update_page(
+                        page_id=task_pid,
+                        properties={
+                            "Sprint": self.notion.relation_property([sprint_pid]),
+                        },
+                    )
+
+        # Update dashboard with sprint board view
+        self._add_sprint_view_to_dashboard(config.dashboard_page_id, config.sprints_db_id)
+
+        self.save_config(config)
+        return config
+
+    def _add_sprint_relation_to_tasks(self, tasks_db_id: str, sprints_db_id: str):
+        """Add a Sprint relation column to the Tasks database."""
+        try:
+            self.notion._retry(
+                self.notion.client.databases.update,
+                database_id=tasks_db_id,
+                properties={
+                    "Sprint": {
+                        "relation": {
+                            "database_id": sprints_db_id,
+                            "single_property": {},
+                        }
+                    }
+                },
+            )
+            logger.info("Added Sprint relation column to Tasks database")
+        except Exception as e:
+            # Column may already exist from a previous sprint run
+            logger.warning(f"Could not add Sprint relation (may already exist): {e}")
+
+    def _create_sprint_page(self, db_id: str, sprint: Sprint) -> str:
+        """Create a single sprint page in the Sprints database."""
+        properties = {
+            "Sprint Name": self.notion.title_property(sprint.name),
+            "Goals": self.notion.rich_text_property(sprint.goals),
+            "Start Date": self.notion.date_property(sprint.start_date),
+            "End Date": self.notion.date_property(sprint.end_date),
+            "Status": self.notion.select_property(sprint.status),
+        }
+        content_blocks = [
+            self.notion.heading_block("Sprint Goals", level=2),
+            self.notion.paragraph_block(sprint.goals),
+            self.notion.divider_block(),
+            self.notion.heading_block("Tasks", level=2),
+        ]
+        for task_title in sprint.task_titles:
+            content_blocks.append(self.notion.bulleted_list_block(task_title))
+
+        return self.notion.create_page(db_id, properties, content_blocks)
+
+    def _add_sprint_view_to_dashboard(self, dashboard_page_id: str, sprints_db_id: str):
+        """Append a sprint board view to the existing dashboard."""
+        self.notion.append_blocks(dashboard_page_id, [
+            self.notion.divider_block(),
+        ])
+        self.notion.create_linked_database_view(
+            dashboard_page_id, sprints_db_id, "Sprint Board"
+        )
+
+    def get_all_tasks(self, config: WorkspaceConfig) -> list[Task]:
+        """Query all tasks from the Notion Tasks database and return as Task models."""
+        pages = self.notion.query_database(config.tasks_db_id)
+        tasks = []
+        for page in pages:
+            props = page.get("properties", {})
+            title = self._extract_title(props.get("Title", {}))
+            description = self._extract_rich_text(props.get("Description", {}))
+            priority = self._extract_select(props.get("Priority", {}))
+            effort = self._extract_select(props.get("Effort", {}))
+            status = self._extract_status(props.get("Status", {}))
+            feature = self._extract_relation_title(props.get("Feature", {}))
+
+            if title and priority and effort:
+                tasks.append(Task(
+                    title=title,
+                    description=description or "",
+                    feature=feature or "",
+                    priority=priority,
+                    effort=effort,
+                    status=status or "Not Started",
+                ))
+                # Ensure task_page_ids stays in sync
+                config.task_page_ids[title] = page["id"]
+        return tasks
+
+    # ── Notion Property Extractors ─────────────────────────────────────
+
+    @staticmethod
+    def _extract_title(prop: dict) -> str:
+        items = prop.get("title", [])
+        return items[0].get("plain_text", "") if items else ""
+
+    @staticmethod
+    def _extract_rich_text(prop: dict) -> str:
+        items = prop.get("rich_text", [])
+        return items[0].get("plain_text", "") if items else ""
+
+    @staticmethod
+    def _extract_select(prop: dict) -> str:
+        sel = prop.get("select")
+        return sel.get("name", "") if sel else ""
+
+    @staticmethod
+    def _extract_status(prop: dict) -> str:
+        st = prop.get("status")
+        return st.get("name", "") if st else ""
+
+    @staticmethod
+    def _extract_relation_title(prop: dict) -> str:
+        relations = prop.get("relation", [])
+        return relations[0].get("id", "") if relations else ""
 
     # ── Markdown to Blocks Converter ───────────────────────────────────
 
