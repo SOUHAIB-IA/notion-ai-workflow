@@ -32,6 +32,17 @@ class UpdateWorkspaceRequest(BaseModel):
     update_description: str
 
 
+class MeetingRequest(BaseModel):
+    notes: str
+
+
+class MeetingResponse(BaseModel):
+    decisions_created: int
+    tasks_created: int
+    tasks_blocked: int
+    message: str
+
+
 class SprintResponse(BaseModel):
     project_name: str
     sprints_count: int
@@ -102,6 +113,26 @@ async def workspace_status():
             detail="No workspace found. Create one first with POST /workspace.",
         )
     return StatusResponse(**status)
+
+
+@app.post("/workspace/meeting", response_model=MeetingResponse)
+async def process_meeting(req: MeetingRequest):
+    """Process meeting notes: extract decisions, action items, blockers via MCP."""
+    try:
+        result = await app.state.orchestrator.process_meeting(req.notes)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No workspace found. Create one first with POST /workspace.",
+            )
+        return MeetingResponse(
+            **result,
+            message="Meeting notes processed via Notion MCP",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/workspace/sprints", response_model=SprintResponse)

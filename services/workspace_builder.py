@@ -4,7 +4,8 @@ from pathlib import Path
 
 from config import settings
 from models.schemas import (
-    Feature, Task, Document, Sprint, SprintPlan, ProjectPlan, WorkspaceConfig,
+    Feature, FeatureUpdate, Task, Document, Sprint, SprintPlan,
+    ProjectPlan, UpdatePlan, WorkspaceConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,7 +118,7 @@ class WorkspaceBuilder:
             properties={
                 "Title": {"title": {}},
                 "Description": {"rich_text": {}},
-                "Feature": {"relation": {"database_id": features_db_id}},
+                "Feature": {"relation": {"database_id": features_db_id, "single_property": {}}},
                 "Priority": {"select": {"options": [
                     {"name": "P0", "color": "red"},
                     {"name": "P1", "color": "orange"},
@@ -145,7 +146,7 @@ class WorkspaceBuilder:
                     {"name": "PRD"}, {"name": "Architecture"},
                     {"name": "Guide"}, {"name": "Meeting Notes"},
                 ]}},
-                "Feature": {"relation": {"database_id": features_db_id}},
+                "Feature": {"relation": {"database_id": features_db_id, "single_property": {}}},
                 "Status": {"status": {}},
             },
         )
@@ -329,6 +330,183 @@ class WorkspaceBuilder:
 
         self.save_config(config)
         return config
+
+    async def get_all_features(self, config: WorkspaceConfig) -> list[Feature]:
+        """Query all features from the Notion Features database via MCP."""
+        result = await self.mcp.query_database(config.features_db_id)
+        pages = result.get("results", []) if isinstance(result, dict) else []
+        features = []
+        for page in pages:
+            props = page.get("properties", {})
+            name = self._extract_title(props.get("Name", {}))
+            description = self._extract_rich_text(props.get("Description", {}))
+            priority = self._extract_select(props.get("Priority", {}))
+            category = self._extract_select(props.get("Category", {}))
+            status = self._extract_status(props.get("Status", {}))
+
+            if name and priority:
+                features.append(Feature(
+                    name=name,
+                    description=description or "",
+                    priority=priority,
+                    category=category or "Backend",
+                ))
+                # Sync config with live Notion page IDs
+                config.feature_page_ids[name] = page["id"]
+        return features
+
+    async def build_context_summary(self, config: WorkspaceConfig) -> str:
+        """Build a rich context string from live Notion data via MCP."""
+        features = await self.get_all_features(config)
+        tasks = await self.get_all_tasks(config)
+
+        lines = [f"Project: {config.project_name}", ""]
+
+        lines.append(f"=== FEATURES ({len(features)}) ===")
+        for f in features:
+            lines.append(f"- {f.name} [{f.priority}] ({f.category}): {f.description}")
+
+        lines.append(f"\n=== TASKS ({len(tasks)}) ===")
+        for t in tasks:
+            lines.append(
+                f"- {t.title} [{t.priority}, {t.effort}] (status: {t.status}) "
+                f"[feature: {t.feature or 'unlinked'}]"
+            )
+
+        return "\n".join(lines)
+
+    async def apply_update_plan(
+        self,
+        config: WorkspaceConfig,
+        update_plan: UpdatePlan,
+        new_tasks: list[Task],
+        new_docs: list[Document] | None = None,
+    ) -> WorkspaceConfig:
+        """Apply an UpdatePlan: create new features and update existing ones via MCP."""
+        # 1. Update existing features
+        for fu in update_plan.updated_features:
+            page_id = config.feature_page_ids.get(fu.name)
+            if not page_id:
+                logger.warning(f"Cannot update feature '{fu.name}': not found in config")
+                continue
+            props = {}
+            if fu.description is not None:
+                props["Description"] = {"rich_text": [{"text": {"content": fu.description}}]}
+            if fu.priority is not None:
+                props["Priority"] = {"select": {"name": fu.priority}}
+            if fu.category is not None:
+                props["Category"] = {"select": {"name": fu.category}}
+            if props:
+                await self.mcp.update_page(page_id=page_id, properties=props)
+                logger.info(f"Updated feature '{fu.name}' via MCP")
+
+        # 2. Add new features, tasks, docs
+        if update_plan.new_features or new_tasks or new_docs:
+            config = await self.add_features(
+                config, update_plan.new_features, new_tasks, new_docs
+            )
+
+        self.save_config(config)
+        return config
+
+    # ── Meeting Support ────────────────────────────────────────────────
+
+    async def apply_meeting_extract(
+        self,
+        config: WorkspaceConfig,
+        extract: "MeetingExtract",
+    ) -> dict:
+        """Write decisions, action-item tasks, and blocker updates to Notion via MCP.
+
+        Returns a summary dict with counts of what was created/updated.
+        """
+        from models.schemas import MeetingExtract  # deferred to avoid circular
+
+        decisions_created = 0
+        tasks_created = 0
+        tasks_blocked = 0
+        today = __import__("datetime").date.today().isoformat()
+
+        # 1. Create decision entries in the Decisions database
+        for d in extract.decisions:
+            await self.mcp.create_page(
+                parent_id=config.decisions_db_id,
+                properties={
+                    "Decision": {"title": [{"text": {"content": d.decision}}]},
+                    "Context": {"rich_text": [{"text": {"content": d.context}}]},
+                    "Date": {"date": {"start": today}},
+                    "Status": {"select": {"name": d.status}},
+                },
+            )
+            decisions_created += 1
+
+        # 2. Create action-item tasks in the Tasks database
+        for ai in extract.action_items:
+            props = {
+                "Title": {"title": [{"text": {"content": ai.title}}]},
+                "Description": {"rich_text": [{"text": {"content": ai.description}}]},
+                "Priority": {"select": {"name": ai.priority}},
+                "Effort": {"select": {"name": ai.effort}},
+            }
+            feature_id = config.feature_page_ids.get(ai.feature) if ai.feature else None
+            if feature_id:
+                props["Feature"] = {"relation": [{"id": feature_id}]}
+            page = await self.mcp.create_page(
+                parent_id=config.tasks_db_id, properties=props
+            )
+            config.task_page_ids[ai.title] = page["id"]
+            tasks_created += 1
+
+        # 3. Mark blocked tasks — update their status via MCP
+        for b in extract.blockers:
+            task_pid = config.task_page_ids.get(b.task_title)
+            if not task_pid:
+                logger.warning(f"Blocker: task '{b.task_title}' not found, skipping")
+                continue
+            # Append a blocker note to the task's description and change status
+            # Notion status "Blocked" may not exist, so we add a callout block instead
+            await self.mcp.append_blocks(task_pid, [
+                {"type": "callout", "callout": {
+                    "rich_text": [{"text": {"content": f"BLOCKED: {b.reason}"}}],
+                    "icon": {"emoji": "🚫"},
+                }},
+            ])
+            tasks_blocked += 1
+
+        # 4. Store meeting notes page in Documents database
+        content_lines = [f"## Meeting Summary", extract.summary, ""]
+        if extract.decisions:
+            content_lines.append("## Decisions")
+            for d in extract.decisions:
+                content_lines.append(f"- [{d.status}] {d.decision} — {d.context}")
+            content_lines.append("")
+        if extract.action_items:
+            content_lines.append("## Action Items")
+            for ai in extract.action_items:
+                feat = f" ({ai.feature})" if ai.feature else ""
+                content_lines.append(f"- [{ai.priority}] {ai.title}{feat}")
+            content_lines.append("")
+        if extract.blockers:
+            content_lines.append("## Blockers")
+            for b in extract.blockers:
+                content_lines.append(f"- {b.task_title}: {b.reason}")
+
+        content_blocks = self._markdown_to_blocks("\n".join(content_lines))
+        await self.mcp.create_page(
+            parent_id=config.docs_db_id,
+            properties={
+                "Title": {"title": [{"text": {"content": f"Meeting Notes — {today}"}}]},
+                "Type": {"select": {"name": "Meeting Notes"}},
+            },
+            children=content_blocks,
+        )
+
+        self.save_config(config)
+        return {
+            "decisions_created": decisions_created,
+            "tasks_created": tasks_created,
+            "tasks_blocked": tasks_blocked,
+        }
 
     # ── Sprint Support ─────────────────────────────────────────────────
 

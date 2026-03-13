@@ -2,6 +2,9 @@ import asyncio
 import logging
 import sys
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -30,6 +33,8 @@ def print_banner():
     banner.append("— Update existing workspace\n")
     banner.append("  status  ", style="bold blue")
     banner.append("— Show current workspace summary\n")
+    banner.append("  meeting ", style="bold cyan")
+    banner.append("— Process meeting notes into decisions & tasks\n")
     banner.append("  sprint  ", style="bold white")
     banner.append("— Plan 2-week sprints from tasks\n")
     banner.append("  plan    ", style="bold magenta")
@@ -170,10 +175,49 @@ async def cmd_sprint(orchestrator):
         )
 
 
+async def cmd_meeting(orchestrator):
+    console.print(
+        "\n[bold cyan]Paste your meeting notes below.[/bold cyan]\n"
+        "[dim]Type END on a new line when done.[/dim]\n"
+    )
+    lines = []
+    while True:
+        try:
+            line = console.input("[dim]...[/dim] ")
+        except (KeyboardInterrupt, EOFError):
+            break
+        if line.strip().upper() == "END":
+            break
+        lines.append(line)
+
+    notes = "\n".join(lines).strip()
+    if not notes:
+        console.print("[red]No meeting notes provided.[/red]")
+        return
+
+    console.print()
+    try:
+        result = await orchestrator.process_meeting(notes, on_status=status_callback)
+    except Exception as e:
+        console.print(f"\n[bold red]Error:[/bold red] {e}")
+        logger.exception("Failed to process meeting notes")
+        return
+
+    if result:
+        table = Table(title="Meeting Processed", border_style="cyan")
+        table.add_column("Item", style="bold")
+        table.add_column("Count", justify="right")
+        table.add_row("Decisions recorded", str(result["decisions_created"]))
+        table.add_row("Action items created", str(result["tasks_created"]))
+        table.add_row("Tasks marked blocked", str(result["tasks_blocked"]))
+        console.print(table)
+
+
 COMMANDS = {
     "new": cmd_new,
     "update": cmd_update,
     "status": cmd_status,
+    "meeting": cmd_meeting,
     "sprint": cmd_sprint,
     "plan": cmd_plan,
 }

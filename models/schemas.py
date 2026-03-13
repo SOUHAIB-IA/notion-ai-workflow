@@ -38,6 +38,51 @@ class SprintPlan(BaseModel):
     sprints: list[Sprint]
 
 
+class FeatureUpdate(BaseModel):
+    """An update to an existing feature (change priority, description, etc.)."""
+    name: str  # must match an existing feature name exactly
+    description: Optional[str] = None
+    priority: Optional[Literal["P0", "P1", "P2", "P3"]] = None
+    category: Optional[str] = None
+
+
+class UpdatePlan(BaseModel):
+    """AI output for workspace updates — separates new features from updates."""
+    new_features: list[Feature] = []
+    updated_features: list[FeatureUpdate] = []
+    summary: str  # what the AI decided to do
+
+
+class Decision(BaseModel):
+    """A decision extracted from meeting notes."""
+    decision: str
+    context: str
+    status: Literal["Proposed", "Accepted", "Rejected"] = "Accepted"
+
+
+class ActionItem(BaseModel):
+    """An action item extracted from meeting notes."""
+    title: str
+    description: str
+    feature: Optional[str] = None  # linked feature name, if relevant
+    priority: Literal["P0", "P1", "P2", "P3"] = "P1"
+    effort: Literal["Small", "Medium", "Large"] = "Medium"
+
+
+class Blocker(BaseModel):
+    """A blocker that affects an existing task."""
+    task_title: str  # must match an existing task title exactly
+    reason: str
+
+
+class MeetingExtract(BaseModel):
+    """AI-extracted structured data from raw meeting notes."""
+    summary: str
+    decisions: list[Decision] = []
+    action_items: list[ActionItem] = []
+    blockers: list[Blocker] = []
+
+
 class ProjectPlan(BaseModel):
     project_name: str
     description: str

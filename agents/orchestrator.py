@@ -1,11 +1,12 @@
 import logging
 
-from models.schemas import ProjectPlan, Task, Document, WorkspaceConfig
+from models.schemas import ProjectPlan, UpdatePlan, Task, Document, WorkspaceConfig
 from agents.planner import PlannerAgent
 from agents.architect import ArchitectAgent
 from agents.task_generator import TaskGeneratorAgent
 from agents.doc_writer import DocWriterAgent
 from agents.sprint_planner import SprintPlannerAgent
+from agents.meeting import MeetingAgent
 from services.workspace_builder import WorkspaceBuilder
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ class Orchestrator:
         self.task_generator = TaskGeneratorAgent()
         self.doc_writer = DocWriterAgent()
         self.sprint_planner = SprintPlannerAgent()
+        self.meeting_agent = MeetingAgent()
         self.builder = WorkspaceBuilder(mcp_client)
 
     async def create_workspace(
@@ -91,7 +93,8 @@ class Orchestrator:
         update_request: str,
         on_status: callable = None,
     ) -> WorkspaceConfig | None:
-        """Update an existing workspace with new features/tasks via MCP."""
+        """Update an existing workspace: reads live state from Notion via MCP,
+        then intelligently adds new features or updates existing ones."""
 
         def status(emoji: str, msg: str):
             if on_status:
@@ -103,36 +106,49 @@ class Orchestrator:
             status("❌", "No existing workspace found. Use 'new' to create one first.")
             return None
 
-        status("🤖", "Analyzing update request...")
-        context = (
-            f"Existing project: {config.project_name}\n"
-            f"Existing features: {', '.join(config.feature_page_ids.keys())}\n\n"
-            f"Update request: {update_request}\n\n"
-            f"Generate ONLY the new features to add. Do not duplicate existing features. "
-            f"Keep the same project name and description. Focus on the update request."
-        )
-        plan = self.planner.plan(context)
+        # Step 1: Read ALL features and tasks from Notion via MCP
+        status("📖", "Reading current workspace from Notion via MCP...")
+        context = await self.builder.build_context_summary(config)
+        status("✅", "Workspace state loaded from Notion")
 
-        existing_names = set(config.feature_page_ids.keys())
-        new_features = [f for f in plan.features if f.name not in existing_names]
+        # Step 2: AI analyzes current state + update request
+        status("🤖", "AI is analyzing what to change...")
+        update_plan = self.planner.plan_update(context, update_request)
 
-        if not new_features:
-            status("ℹ️", "No new features to add.")
+        n_new = len(update_plan.new_features)
+        n_upd = len(update_plan.updated_features)
+        status("💡", f"AI decision: {update_plan.summary}")
+
+        if n_new == 0 and n_upd == 0:
+            status("ℹ️", "No changes needed.")
             return config
 
-        status("📋", f"Generating tasks for {len(new_features)} new features...")
-        new_tasks: list[Task] = []
-        for feature in new_features:
-            tasks = self.task_generator.generate(feature)
-            new_tasks.extend(tasks)
+        if n_upd > 0:
+            status("🔄", f"Updating {n_upd} existing feature(s)...")
 
+        # Step 3: Generate tasks for NEW features only
+        new_tasks: list[Task] = []
+        if n_new > 0:
+            status("📋", f"Generating tasks for {n_new} new feature(s)...")
+            for feature in update_plan.new_features:
+                tasks = self.task_generator.generate(feature)
+                new_tasks.extend(tasks)
+
+        # Step 4: Write docs for new P0/P1 features
         new_docs: list[Document] = []
-        priority_new = [f for f in new_features if f.priority in ("P0", "P1")]
+        priority_new = [f for f in update_plan.new_features if f.priority in ("P0", "P1")]
         if priority_new:
-            status("📄", "Writing docs for new priority features...")
+            status("📄", f"Writing docs for {len(priority_new)} priority feature(s)...")
+            # Build a temporary ProjectPlan for doc writer context
+            temp_plan = ProjectPlan(
+                project_name=config.project_name,
+                description="",
+                tech_stack=[],
+                features=update_plan.new_features,
+                architecture_notes="",
+            )
             for feature in priority_new:
-                plan.features = new_features
-                content = self.doc_writer.write(plan, feature.name)
+                content = self.doc_writer.write(temp_plan, feature.name)
                 new_docs.append(Document(
                     title=f"PRD: {feature.name}",
                     doc_type="PRD",
@@ -140,15 +156,78 @@ class Orchestrator:
                     feature=feature.name,
                 ))
 
-        status("🚀", "Adding to Notion workspace via MCP...")
-        config = await self.builder.add_features(config, new_features, new_tasks, new_docs)
-        status(
-            "✅",
-            f"Added {len(new_features)} features, {len(new_tasks)} tasks, "
-            f"{len(new_docs)} documents",
+        # Step 5: Apply all changes to Notion via MCP
+        status("🚀", "Applying changes to Notion via MCP...")
+        config = await self.builder.apply_update_plan(
+            config, update_plan, new_tasks, new_docs
         )
 
+        parts = []
+        if n_upd > 0:
+            parts.append(f"updated {n_upd} feature(s)")
+        if n_new > 0:
+            parts.append(f"added {n_new} feature(s)")
+        if new_tasks:
+            parts.append(f"{len(new_tasks)} task(s)")
+        if new_docs:
+            parts.append(f"{len(new_docs)} doc(s)")
+        status("✅", f"Done: {', '.join(parts)}")
+
         return config
+
+    async def process_meeting(
+        self,
+        meeting_notes: str,
+        on_status: callable = None,
+    ) -> dict | None:
+        """Process meeting notes: extract decisions, action items, blockers
+        and write them to Notion via MCP."""
+
+        def status(emoji: str, msg: str):
+            if on_status:
+                on_status(emoji, msg)
+            logger.info(msg)
+
+        config = self.builder.load_config()
+        if not config:
+            status("❌", "No existing workspace found. Use 'new' to create one first.")
+            return None
+
+        # Step 1: Read current state from Notion via MCP
+        status("📖", "Reading current workspace from Notion via MCP...")
+        context = await self.builder.build_context_summary(config)
+
+        # Step 2: AI extracts structured data from meeting notes
+        status("🤖", "AI is analyzing meeting notes...")
+        extract = self.meeting_agent.extract(meeting_notes, context)
+        status("✅", f"Extracted: {extract.summary}")
+
+        n_dec = len(extract.decisions)
+        n_act = len(extract.action_items)
+        n_blk = len(extract.blockers)
+        status(
+            "📊",
+            f"Found {n_dec} decision(s), {n_act} action item(s), {n_blk} blocker(s)",
+        )
+
+        if n_dec == 0 and n_act == 0 and n_blk == 0:
+            status("ℹ️", "Nothing actionable found in meeting notes.")
+            return {"decisions_created": 0, "tasks_created": 0, "tasks_blocked": 0}
+
+        # Step 3: Apply everything to Notion via MCP
+        status("🚀", "Writing to Notion via MCP...")
+        result = await self.builder.apply_meeting_extract(config, extract)
+
+        parts = []
+        if result["decisions_created"]:
+            parts.append(f"{result['decisions_created']} decision(s)")
+        if result["tasks_created"]:
+            parts.append(f"{result['tasks_created']} task(s)")
+        if result["tasks_blocked"]:
+            parts.append(f"{result['tasks_blocked']} task(s) marked blocked")
+        status("✅", f"Done: {', '.join(parts)}")
+
+        return result
 
     async def plan_sprints(
         self,
